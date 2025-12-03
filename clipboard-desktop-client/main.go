@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/gorilla/websocket"
+	"os"
 	"syscall"
 	"unsafe"
 
@@ -26,6 +28,8 @@ var (
 	procGlobalUnlock                  = kernel32.NewProc("GlobalUnlock")
 	procGetModuleHandleW              = kernel32.NewProc("GetModuleHandleW")
 )
+
+var wsConn *websocket.Conn
 
 const (
 	wmClipboardUpdate = 0x031D // windows clipboard message
@@ -62,6 +66,9 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		text, err := getClipboardText()
 		if err == nil {
 			fmt.Println("clipboard updated:", text)
+			if err = wsConn.WriteMessage(websocket.TextMessage, []byte(text)); err != nil {
+				fmt.Println("error writing clipboard message:", err)
+			}
 		} else {
 			fmt.Println("read clipboard failed:", err)
 		}
@@ -80,7 +87,11 @@ func getClipboardText() (string, error) {
 	if r == 0 {
 		return "", err
 	}
-	defer procCloseClipboard.Call()
+	defer func() {
+		if _, _, err := procCloseClipboard.Call(); err != nil {
+			fmt.Println("close clipboard failed:", err)
+		}
+	}()
 
 	h, _, _ := procGetClipboardData.Call(uintptr(cfUnicodeText))
 	if h == 0 {
@@ -91,13 +102,46 @@ func getClipboardText() (string, error) {
 	if ptr == 0 {
 		return "", fmt.Errorf("GlobalLock failed")
 	}
-	defer procGlobalUnlock.Call(h)
+	defer func() {
+		if _, _, err := procGlobalUnlock.Call(h); err != nil {
+			fmt.Println("global unlock failed:", err)
+		}
+	}()
 
 	text := syscall.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(ptr))[:])
 	return text, nil
 }
 
 func main() {
+	// websocket connect
+	url := "ws://127.0.0.1:8080/"
+
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		fmt.Println("connect failed:", err)
+		return
+	}
+	wsConn = conn
+	defer func() {
+		if err := conn.Close(); err != nil {
+			fmt.Println("close failed:", err)
+		}
+	}()
+	fmt.Println("connect success")
+
+	go func() {
+		for {
+			msgType, msg, err := conn.ReadMessage()
+			if err != nil {
+				fmt.Println("read message failed:", err)
+				os.Exit(1)
+			}
+			if msgType == websocket.TextMessage {
+				fmt.Println("Received message: ", string(msg))
+			}
+		}
+	}()
+
 	hInstance, _, _ := procGetModuleHandleW.Call(0)
 
 	className, _ := windows.UTF16PtrFromString("MyHiddenWindowClass")
@@ -136,7 +180,12 @@ func main() {
 		fmt.Println("AddClipboardFormatListener failed:", err)
 		return
 	}
-	defer procRemoveClipboardFormatListener.Call(hwnd)
+	defer func() {
+		if _, _, err := procRemoveClipboardFormatListener.Call(hwnd); err != nil {
+			fmt.Println("remove clipboard format listener failed:", err)
+			return
+		}
+	}()
 
 	fmt.Println("Listing Clipboard...")
 
@@ -146,7 +195,13 @@ func main() {
 		if ret == 0 {
 			break
 		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+		if _, _, err := procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg))); err != nil {
+			fmt.Println("TranslateMessage failed:", err)
+			break
+		}
+		if _, _, err := procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg))); err != nil {
+			fmt.Println("DispatchMessageW failed:", err)
+			break
+		}
 	}
 }
